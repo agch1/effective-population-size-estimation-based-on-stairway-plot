@@ -1,0 +1,747 @@
+# 1. Configuración inicial del entorno.
+```{r, echo=TRUE}
+set.seed(123)
+library(optimx)
+library(ggplot2)
+```
+
+```{r, echo=TRUE}
+#EJEMPLO
+n <- 10 # Tamaño de la muestra
+mu <- 1e-7  # Tasa de mutación
+mutation_rate <- mu
+#inicialización de theta para n segmentos (valor 1 es t_2 y valor n es t_n+1)
+#theta_values <- rep(0.01,n-1) #for testing with Ne constant
+theta_values <- 10^(runif(n-1, -3, -1))  # este es un rango similar al usado en Stairway Plot. (Aqui se pone una distribución exponencial de valores). Los valores de theta/4*mu) son las Ne. Las thetas son calculadas por posicion, no por fragmento
+theta_values/(4*mu) # Ne para diploide en este ejemplo. Estas Ne las definimos desde la ultima coalecencia (primer valor, k=2) hasta el primer evento de coalescencia con las n muestras (k=n), por tanto, el array de 1:(n-1) corresponde a k=2 hasta k=n-1 (de arriba a abajo).
+
+#En este ejemplo no se han incluido los tiempos de coalescencia en los que ocurren los procesos de cambio de tamaño efectivo. Se ha asumido que son los tiempos esperados dado su tamaño efectivo en ese momento.
+
+L <- 10000 #Longitud de la secuencia estudiada en la muestra
+```
+
+# 2. Definición de las funciones principales.
+## - Tiempo esperado de coalescencia:
+```{r, echo=TRUE}
+#diploides
+E_Tk <- function(k, Nk) {
+  if (k > 1) {
+    return((4 * Nk) / (k * (k - 1)))
+  } else {
+    return(0)  #Para k=1, el tiempo de coalescencia no tiene sentido
+  }
+}
+E_Tk(10,1000)
+
+#En este ejemplo, los tiempos de coalescencia sucesivos (no acumulados) se asumen serian los esperados, por tanto, serian (en relacion al tamaño efectivo):
+ET_values <- array(0,dim=c(n-1))
+for(i in 2:n) {
+  ET_values[i-1] <- theta_values[i-1]/(i*(i-1))
+}
+ET_values
+#en generaciones seria (en SNM serian 2N generaciones para n=2)
+ET_values/(mu)
+#cumulativo seria
+ETcum_values <- array(0,dim=c(n-1))
+for(i in 2:n) {
+  ETcum_values[i-1] <- ETcum_values[i-1] + sum(ET_values[(i-1):(n-1)])
+}
+ETcum_values
+#calculando en numero de generaciones, seria 
+ETcum_values/(mu)
+```
+
+## - Probabilidad de coalescencia:
+```{r, echo=TRUE}
+# función para calcular el coeficiente binomial
+lbinomial <- function(n, k) {
+  if (k > n || k < 0) return(0)
+  return(lchoose(n, k))
+}
+#check
+lbinomial(5,2)
+
+# Función para calcular probabilidad combinatoria
+P_ki <- function(k, i, n) {
+  if (k < 2 || k > (n - i + 1) || n <= i || i < 1) {
+    return(0)
+  }
+  return(exp(lbinomial(n - i - 1, k - 2) - lbinomial(n - 1, k - 1)))
+}
+#check
+P_ki(2,1,10)
+#choose(10 - 1 - 1, 2 - 2)/choose(10 - 1, 2 - 1)
+
+P_i <- function(i, n, mu, theta_values) {
+  Pi_value <- 0
+  #ajusta el rango a partir de i=1
+  if (i > 0) {
+    for (k in 2:(n - i + 1)) {
+      prob <- P_ki(k, i, n)
+      if (is.finite(prob) && prob > 0) {
+        #Fórmula de Pi
+        Pi_value <- Pi_value + (k * prob * (theta_values[k-1] / (k * (k - 1))))
+      } else {
+        # Aviso si la probabilidad no es válida
+        print(paste("Warning: Invalid probability for k =", k, "i =", i))
+      }
+    }
+  }
+  return(Pi_value)
+}
+
+#check. Calcular P_i para i=3 dado Ne_k cambiantes a lo largo del tiempo
+P_i(3, n, mu, theta_values[1:(n-1)])
+
+#Calcular SFS para Ne_k cambiantes a lo largo del tiempo para una region de tamaño L
+SFS <- array(0,dim=c(n-1))
+for(i in 1:(n-1)) {
+  SFS[i] <- P_i(i,n,mu,theta_values[1:(n-1)]) * L
+}
+
+#SFS esperado para una mut_rate mu y unas Ne_k dadas
+SFS
+plot(SFS,type="b")
+
+#Comparado bajo un SFS esperado con un modelo SNM:
+theta_snm <- sum(SFS)/sum(1/(1:(n-1))) # theta=S/an
+SFS_snm <- theta_snm / (1:(n-1)) #SFS_i=theta/i
+ratio_sfs <- log10(SFS / SFS_snm) #diffs in log10 entre SFS y SFS_snm (Ne constante)
+plot(SFS,type="b"); lines(SFS_snm,type="b",col="red"); legend("topright",col = c("black","red"),legend=c("SFS","SFS_snm"),lwd = c(1,1)) #SFS
+plot(ratio_sfs,type="b",ylab="log10 diffs SFS versus SFS_snm"); abline(h=0,col="red") #SFS relativas (Ne constante invariable seria la recta a 0)
+```
+
+## - Logaritmo de likelihood:
+```{r, echo=TRUE}
+log_likelihood <- function(SFS_obs, n, mu, theta_values,L) {
+  #calcular p_i
+  p_i <- array(0,dim=c(n)) 
+  #los valores de i se desplazan uno en el array para guardar i=0 
+  for(i in c(1:n-1)) {
+    p_i[i+1] <- P_i(i, n, mu, theta_values)
+  }
+  #calular el valor de p_i para i=0
+  p_i[1] <- 1 - sum(p_i)
+  if(p_i[1]<0) return(-1e9)
+  
+  # Calcular la log-verosimilitud
+  SFS_o <- c(L-sum(SFS_obs),SFS_obs) #añadir las posiciones con no variantes (i=0) en el primer valor del array
+  Lm <- lfactorial(L)
+  for(i in c(1:n)) {
+    Lm <- Lm + log(p_i[i]) * SFS_o[i] - lfactorial(SFS_o[i])
+  }
+  if(is.na(Lm) || is.infinite(Lm)) 
+    return(-1e9)
+  return(Lm)
+}
+
+#check
+SFS_obs <- round(SFS,0)
+log_likelihood(SFS_obs, n, mu, theta_values[1:(n-1)], L)
+```
+
+# 3. Optimización de theta
+```{r, echo=TRUE}
+# Función de optimización para theta
+optimize_theta <- function(SFS_obs, n, mu, theta_range, L) {
+  
+  theta_values <- runif(n=length(SFS_obs),min=min(theta_range),max=max(theta_range))
+  objective_function <- function(theta_values) {
+    log_likelihood(SFS_obs, n, mu, theta_values, L)
+  }
+  
+  result <- optim(
+    par = theta_values,
+    fn = objective_function,
+    method = "L-BFGS-B",
+    lower = rep(min(theta_range), length(SFS_obs)),  # Límite inferior
+    upper = rep(max(theta_range), length(SFS_obs)),  # Límite superior
+    control = list(fnscale = -1)  #Maximizar la log-verosimilitud
+  )
+  
+  return(result)
+}
+
+result <- optimize_theta(SFS_obs=SFS_obs, n=n, mu=mu,theta_range=c(1e-5,1e-1), L=L)
+print(result)
+```
+
+## - Valores optimizados de theta
+```{r, echo=TRUE}
+# Extraer los valores optimizados de theta
+optimized_theta_values <- result$par
+#optimized_theta_values <- NULL
+#for(i in c(1:(n-1)))  
+#  optimized_theta_values <- c(optimized_theta_values,result[1,i])
+print(optimized_theta_values)
+```
+
+# 4. Comparación SFS observado y SFS esperado
+```{r, echo=TRUE}
+# Verificamos los valores de SFS_obs y SFS_exp
+print(SFS_obs)
+
+# Calcular SFS_exp
+SFS_exp <- numeric(length(SFS_obs))
+for (i in 1:(n - 1)) {
+  SFS_exp[i] <- P_i(i, n, mu, optimized_theta_values)
+}
+
+print(SFS_exp*L)
+```
+
+## - Gráficos
+```{r, echo=TRUE}
+#Compara los valores observados y esperados
+plot(SFS_exp_L,type="b",xlab="freq");lines(SFS_obs,type="b",col="red");legend("topright",col = c("black","red"),legend=c("Inferred","True"),lwd = c(1,1))
+#Differences
+plot(log10(SFS_obs/SFS_exp_L),type="b",xlab="freq");abline(h=0,col="red");legend("topright",col = c("black","red"),legend=c("Inferred","True"),lwd = c(1,1))
+```
+
+# 5. Cálculo del tiempo esperado de coalescencia (Ti)
+
+```{r, echo=TRUE}
+# Función para calcular Ti
+calculate_Ti <- function(n, theta_values) {
+  Ti_values <- numeric(n - 1)
+  for (i in 2:n) {
+    #suma de thetak/(k*(k-1)) desde k=i hasta k=n
+    for(j in i:n) {
+      Ti_values[i - 1] <- Ti_values[i - 1] + theta_values[j-1]/(j*(j-1))
+    }
+  }
+  return(Ti_values)
+}
+
+Ti_values <- calculate_Ti(n, optimized_theta_values)
+print(Ti_values) #valores de Ti en relacion a mu
+print(Ti_values/(mu)) #Valores en generaciones
+#Compara los valores observados y esperados
+plot(Ti_values/(mu),type="b",ylim=c(0,max(Ti_values/(mu),ETcum_values/(mu))),ylab="Ne",xlab="Coalescence event"); lines(ETcum_values/(mu),col="red",type="b");legend("topright",col = c("black","red"),legend=c("Inferred","True"),lwd = c(1,1))
+```
+
+- Tamaño efectivo vs tiempo
+```{r, echo=TRUE}
+# Compara los valores observados y esperados del tiempo y el Ne: logaritmo
+plot(x=(Ti_values/mu), y=(optimized_theta_values/(4*mu)), type="s", log="y", ylim=c(1e3,1e6), xlab="Time (gen)", ylab="Ne", main="Skyline plot Ne vs Time"); lines(x=(ETcum_values/mu), y=(theta_values/(4*mu)), type="s", col="red");legend("topright",col = c("black","red"), legend=c("Inferred","True"),lwd = c(1,1))
+```
+
+# 6. Cálculo de SFS esperado bajo diferentes modelos demográficos
+```{r, echo=TRUE}
+library(reticulate)
+#for macOS uncomment this 2 next rows. Otherwise comment!
+#path_to_python <- "/opt/miniconda3/python.app/Contents/MacOS/python"
+#use_python(path_to_python)
+msprime <- import("msprime")
+
+simulate_SFS <- function(n, model = "stationary", params = list(), reps = 1, L=1e6, recombination_rate = 1e-6, mutation_rate = 1e-7, Ne=1e4) {
+  
+  n <- as.integer(n)
+  SFS_simulated <- matrix(0, nrow = reps, ncol = n - 1)
+
+  for (r in 1:reps) {
+    simulation <- NULL
+    
+    #SFS según el modelo
+    if (model == "stationary") {
+      simulation <- msprime$simulate(
+        sample_size = n,
+        length = L,
+        recombination_rate = recombination_rate,
+        mutation_rate = mutation_rate,
+        Ne = Ne
+      )
+    } else if (model == "two_epochs") {
+      T_change <- params$T_change
+      N_ratio <- params$N_ratio
+      population_configurations = list(
+        msprime$PopulationConfiguration(initial_size = Ne, sample_size = n)
+      )
+      demographic_events = list(
+        msprime$PopulationParametersChange(
+          time = T_change,
+          initial_size = Ne * N_ratio,
+          population = as.integer(0)
+       )
+      )
+      simulation <- msprime$simulate(
+        length = L,
+        recombination_rate = recombination_rate,
+        mutation_rate = mutation_rate,
+        population_configurations = population_configurations,
+        demographic_events = demographic_events
+      )
+    } else if (model == "bottleneck") {
+      T_bottleneck <- params$T_bottleneck
+      N_bottleneck_ratio <- params$N_bottleneck_ratio
+      T_recovery <- params$T_recovery
+      population_configurations = list(
+        msprime$PopulationConfiguration(initial_size = Ne, sample_size = n)
+      )
+      demographic_events = list(
+        msprime$PopulationParametersChange(
+          time = T_bottleneck,
+          initial_size = N_bottleneck_ratio * Ne,
+          population = as.integer(0)
+        ),
+        msprime$PopulationParametersChange(
+          time = T_recovery,
+          initial_size = Ne,
+          population = as.integer(0)
+        )
+      )
+      simulation <- msprime$simulate(
+        length = L,
+        recombination_rate = recombination_rate,
+        mutation_rate = mutation_rate,
+        population_configurations = population_configurations,
+        demographic_events = demographic_events
+      )
+    } else if (model == "migration_one_direction") {
+      m_rate <- params$m_rate
+      N1 <- params$N1
+      N2 <- params$N2
+      population_configurations = list(
+        msprime$PopulationConfiguration(initial_size = N1, sample_size = as.integer(n / 2)),  
+       msprime$PopulationConfiguration(initial_size = N2, sample_size = as.integer(n / 2))
+     )
+     migration_matrix = list(
+       list(0, 0),
+       list(m_rate, 0)
+     )
+     simulation <- msprime$simulate(
+        length = L,
+        recombination_rate = recombination_rate,
+        mutation_rate = mutation_rate,
+        population_configurations = population_configurations,
+        migration_matrix = migration_matrix
+      )
+    } else if (model == "multi_epoch") {
+      epoch_changes <- params$epoch_changes
+      population_configurations = list(
+        msprime$PopulationConfiguration(initial_size = Ne, sample_size = n)
+      )
+      demographic_events = lapply(epoch_changes, function(change) {
+        msprime$PopulationParametersChange(
+          time = change$time,
+          initial_size = change$N_ratio * Ne,
+          population = as.integer(0)
+        )
+      })
+      simulation <- msprime$simulate(
+        length = L,
+        recombination_rate = recombination_rate,
+        mutation_rate = mutation_rate,
+        population_configurations = population_configurations,
+        demographic_events = demographic_events
+     )
+    } else {
+      stop("Modelo no reconocido")
+    }
+
+    sfs <- simulation$allele_frequency_spectrum(mode = "site", polarised=TRUE)
+    sfs <- as.numeric(sfs[2:n])
+    sfs <- sfs * L
+    SFS_simulated[r, ] <- sfs
+  }
+  return(colMeans(SFS_simulated))
+}
+```
+
+## - Modelo estacionario
+```{r, echo=TRUE}
+SFS_stationary <- simulate_SFS(n=10, model = "stationary", reps = 1, L=1e6, Ne=1e4)
+print("Modelo Estacionario:")
+print(SFS_stationary)
+```
+
+## - Modelo de expansión de dos épocas
+```{r, echo=TRUE}
+params_two_epochs_expansion <- list(T_change = 1e3, N_ratio = 0.1)
+SFS_two_epochs_expansion <- simulate_SFS(n=10, model = "two_epochs", params = params_two_epochs_expansion, reps = 1, L=1e6, mutation_rate = 1e-7, Ne=1e4)
+print("Modelo de Reducción de Dos Épocas:")
+print(SFS_two_epochs_expansion)
+```
+
+## - Modelo de reducción de dos épocas
+```{r, echo=TRUE}
+params_two_epochs_reduction <- list(T_change = 1e3, N_ratio = 10)
+SFS_two_epochs_reduction <- simulate_SFS(n=10, model = "two_epochs", params = params_two_epochs_reduction, reps = 1, L=1e6, mutation_rate = 1e-7, Ne=1e3)
+print("Modelo de Expansión de Dos Épocas:")
+print(SFS_two_epochs_reduction)
+```
+
+## - Modelo bottleneck
+```{r, echo=TRUE}
+params_bottleneck <- list(T_bottleneck = 1e3, N_bottleneck_ratio = 0.1, T_recovery = 5e3)
+SFS_bottleneck <- simulate_SFS(n=10, model = "bottleneck", params = params_bottleneck, reps = 1, L=1e6, mutation_rate = 1e-7, Ne=1e4)
+print("Modelo de Cuello de Botella:")
+print(SFS_bottleneck)
+```
+
+## - Modelo con migración
+```{r, echo=TRUE}
+params_migration <- list(m_rate = 5e-5, N1 = 1e3, N2 = 1e3)
+SFS_migration <- simulate_SFS(n=10, "migration_one_direction", params = params_migration, reps = 1, L=1e6, mutation_rate = 1e-7)
+print("Modelo de Migración:")
+print(SFS_migration)
+```
+
+## - Modelo de múltiples épocas
+```{r, echo=TRUE}
+epoch_changes <- list(list(time = 2500, N_ratio = 2), list(time = 5000, N_ratio = 1), list(time = 7500, N_ratio = 0.1), list(time = 10000, N_ratio = 1))
+params_multi_epoch <- list(epoch_changes = epoch_changes)
+SFS_multi_epoch <- simulate_SFS(n=10, model = "multi_epoch", params = params_multi_epoch, reps = 1, L=1e6, mutation_rate = 1e-7, Ne=1e4)
+print("Modelo de Múltiples Épocas:")
+print(SFS_multi_epoch)
+```
+
+# 7. Comparación de SFS según el modelo demográfico
+```{r, echo=TRUE}
+library(reshape2)
+comparison_data <- data.frame(
+  Frequency = 1:(n - 1),
+  Stationary = SFS_stationary/sum(SFS_stationary),
+  Expansion = SFS_two_epochs_expansion/sum(SFS_two_epochs_expansion),
+  Reduction = SFS_two_epochs_reduction/sum(SFS_two_epochs_reduction),
+  Bottleneck = SFS_bottleneck/sum(SFS_bottleneck),
+  Migration = SFS_migration/sum(SFS_migration),
+  MultiEpoch = SFS_multi_epoch/sum(SFS_multi_epoch)
+)
+
+comparison_data_long <- melt(comparison_data, id.vars = "Frequency")
+
+ggplot(comparison_data_long, aes(x = Frequency, y = value, color = variable)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "SFS under different demographic models",
+    x = "freq",
+    y = "number of sites",
+    color = "model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+    plot.margin = margin(20, 20, 20, 20),
+    legend.position = c(0.90, 0.73),
+    legend.box.background = element_rect(color = "black", fill = "white", linewidth = 0.5),
+    legend.key.size = unit(1, "lines"),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1) 
+  ) +
+  scale_color_manual(values = c("Stationary" = "red", "Expansion" = "darkolivegreen3", "Reduction" = "darkorchid", "Bottleneck" = "gold", "Migration" = "snow3", "MultiEpoch" = "lightblue"))
+```
+
+# 8. Función de Remuestreo: Bootstrap
+
+```{r, echo=TRUE}
+bootstrap_SFS <- function(SFS_obs, n_bootstrap = 1000) {
+  bootstrap_results <- matrix(0, nrow = n_bootstrap, ncol = length(SFS_obs))
+  for (b in 1:n_bootstrap) {
+    bootstrap_sample <- sample(c(1:(n-1)), size = sum(SFS_obs), replace = TRUE, prob=SFS_obs)
+    bootstrap_sample_ <- NULL
+    for(i in c(1:(n-1)))
+      bootstrap_sample_ <- cbind(bootstrap_sample_,sum(bootstrap_sample==i))
+    bootstrap_results[b, ] <- bootstrap_sample_
+  }
+  return(bootstrap_results)
+}
+bootstrap_results <- bootstrap_SFS(SFS_obs, n_bootstrap = 1000)
+```
+
+# 9. Estimación del tamaño efectivo y los tiempos de los cambios de tamaño en cada escenario
+
+## - Modelo estacionario:
+```{r, echo=TRUE}
+# CALCULAR Ne Y TIEMPOS CON LAS FUNCIONES DESARROLLADAS
+mutation_rate = 1e-7; n<-10; L<-1e6
+result_theta <- optimize_theta(SFS_obs=SFS_stationary, n=n, mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+result_theta_estacionario <- result_theta$par
+result_Ti_values_estacionario <- calculate_Ti(n, result_theta_estacionario)
+
+# BOOTSTRAP
+n_bootstrap <- 100
+bootstrap_results_matrix_Ne <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results_matrix_Ti <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results <- bootstrap_SFS(SFS_stationary, n_bootstrap = n_bootstrap)
+for(b in 1:n_bootstrap) {
+  bootstrap_result_theta <- optimize_theta(SFS_obs=bootstrap_results[b,], n=n,
+                                                        mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+  bootstrap_result_theta_estacionario <- bootstrap_result_theta$par
+  if(!is.null(bootstrap_result_theta_estacionario)) {
+    bootstrap_result_Ti_values_estacionario <- calculate_Ti(n=n, theta_values = bootstrap_result_theta_estacionario)
+  
+    bootstrap_results_matrix_Ne[b,] <- bootstrap_result_theta_estacionario/(4*mutation_rate)
+    bootstrap_results_matrix_Ti[b,] <- bootstrap_result_Ti_values_estacionario/mutation_rate
+  }
+}
+
+# MOSTRAR LOS RESULTADOS EN GRAFICOS 
+# Bootstrap
+plot(bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,], type="s", xlab="Time (gen)", ylab="Ne", main="STATIONARY\n Skyline plot Ne vs Time", ylim=c(min(bootstrap_results_matrix_Ne), max(bootstrap_results_matrix_Ne))); 
+for(b in 2:n_bootstrap) 
+  lines(x=bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,],col="grey",type="s")
+
+# Real parameters
+lines(x=(result_Ti_values_estacionario/mutation_rate),  y=rep(1e4,n-1), type="s",  col="red")
+
+#Inferred parameters
+lines(x=(result_Ti_values_estacionario/mutation_rate),  y=(result_theta_estacionario/(4*mutation_rate)), type="s", col="black"); 
+legend("topright",col = c("black","red","grey"),legend=c("Inferred","True","Bootstrap"),lwd = c(1,1,1))
+```
+
+## - Modelo de Expansión de Dos Épocas:
+```{r, echo=TRUE}
+# CALCULAR Ne Y TIEMPOS CON LAS FUNCIONES DESARROLLADAS
+mutation_rate = 1e-7; n<-10; L<-1e6; Ne<-1e4; params_two_epochs_expansion <- list(T_change = 1e3, N_ratio = 0.1)
+result_theta <- optimize_theta(SFS_obs=SFS_two_epochs_expansion, n=n, mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+result_theta_two_epochs_expansion <- result_theta$par
+result_Ti_values_two_epochs_expansion <- calculate_Ti(n, result_theta_two_epochs_expansion)
+
+# BOOTSTRAP
+n_bootstrap <- 100
+bootstrap_results_matrix_Ne <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results_matrix_Ti <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results <- bootstrap_SFS(SFS_two_epochs_expansion, n_bootstrap = n_bootstrap)
+for(b in 1:n_bootstrap) {
+  bootstrap_result_theta <- optimize_theta(SFS_obs=bootstrap_results[b,], n=n,
+                                                        mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+  bootstrap_result_theta_two_epochs_expansion <- bootstrap_result_theta$par
+  if(!is.null(bootstrap_result_theta_two_epochs_expansion)) {
+    bootstrap_result_Ti_values_two_epochs_expansion <- calculate_Ti(n=n, theta_values = bootstrap_result_theta_two_epochs_expansion)
+  
+    bootstrap_results_matrix_Ne[b,] <- bootstrap_result_theta_two_epochs_expansion/(4*mutation_rate)
+    bootstrap_results_matrix_Ti[b,] <- bootstrap_result_Ti_values_two_epochs_expansion/mutation_rate
+  }
+}
+
+# MOSTRAR LOS RESULTADOS EN GRAFICOS 
+# Bootstrap
+plot(bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,], type="s", xlab="Time (gen)", ylab="Ne", main="TWO EPOCHS EXPANSION\n Skyline plot Ne vs Time", ylim=c(min(bootstrap_results_matrix_Ne), max(bootstrap_results_matrix_Ne))); 
+for(b in 2:n_bootstrap) 
+  lines(x=bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,],col="grey",type="s")
+
+# Real parameters
+x_values <- seq(from = min(result_Ti_values_two_epochs_expansion/mutation_rate),  to = max(result_Ti_values_two_epochs_expansion/mutation_rate), length.out = 100)
+
+is_before_T_change <- x_values < params_two_epochs_expansion$T_change
+
+y_values <- c(rep(Ne, sum(is_before_T_change)), rep(Ne * params_two_epochs_expansion$N_ratio, sum(!is_before_T_change)))
+
+lines(x = x_values, y = y_values, type = "s", col = "red")
+
+# Inferred parameters
+lines(x=(result_Ti_values_two_epochs_expansion/mutation_rate),  y=(result_theta_two_epochs_expansion/(4*mutation_rate)), type="s", col="black"); 
+legend("topright",col = c("black","red","grey"),legend=c("Inferred","True","Bootstrap"),lwd = c(1,1,1))
+```
+
+## - Modelo de Reduccion de Dos Épocas:
+```{r, echo=TRUE}
+# CALCULAR Ne Y TIEMPOS CON LAS FUNCIONES DESARROLLADAS
+mutation_rate = 1e-7; n<-10; L<-1e6; Ne<-1e3; params_two_epochs_reduction <- list(T_change = 1e3, N_ratio = 10)
+result_theta <- optimize_theta(SFS_obs=SFS_two_epochs_reduction, n=n, mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+result_theta_two_epochs_reduction <- result_theta$par
+result_Ti_values_two_epochs_reduction <- calculate_Ti(n, result_theta_two_epochs_reduction)
+
+# BOOTSTRAP
+n_bootstrap <- 100
+bootstrap_results_matrix_Ne <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results_matrix_Ti <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results <- bootstrap_SFS(SFS_two_epochs_reduction, n_bootstrap = n_bootstrap)
+for(b in 1:n_bootstrap) {
+  bootstrap_result_theta <- optimize_theta(SFS_obs=bootstrap_results[b,], n=n,
+                                                        mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+  
+  bootstrap_result_theta_two_epochs_reduction <- bootstrap_result_theta$par
+  if(!is.null(bootstrap_result_theta_two_epochs_reduction)) {
+    bootstrap_result_Ti_values_two_epochs_reduction <- calculate_Ti(n=n, theta_values = bootstrap_result_theta_two_epochs_reduction)
+  
+    bootstrap_results_matrix_Ne[b,] <- bootstrap_result_theta_two_epochs_reduction/(4*mutation_rate)
+    bootstrap_results_matrix_Ti[b,] <- bootstrap_result_Ti_values_two_epochs_reduction/mutation_rate
+  }
+}
+
+# MOSTRAR LOS RESULTADOS EN GRAFICOS 
+# Bootstrap
+plot(bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,], type="s", xlab="Time (gen)", ylab="Ne", main="TWO EPOCHS REDUCTION\n Skyline plot Ne vs Time", ylim=c(min(bootstrap_results_matrix_Ne), max(bootstrap_results_matrix_Ne))); 
+for(b in 2:n_bootstrap) 
+  lines(x=bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,],col="grey",type="s")
+
+# Real parameters
+x_values <- seq(from = min(result_Ti_values_two_epochs_reduction/mutation_rate), to = max(result_Ti_values_two_epochs_reduction/mutation_rate), length.out = 100)
+
+is_before_T_change <- x_values < params_two_epochs_reduction$T_change
+
+y_values <- c(rep(Ne, sum(is_before_T_change)), rep(Ne * params_two_epochs_reduction$N_ratio, sum(!is_before_T_change)))
+
+lines(x = x_values, y = y_values, type = "s", col = "red")
+
+# Inferred parameters
+lines(x=(result_Ti_values_two_epochs_reduction/mutation_rate),  y=(result_theta_two_epochs_reduction/(4*mutation_rate)), type="s", col="black"); 
+legend("topright",col = c("black","red","grey"),legend=c("Inferred","True","Bootstrap"),lwd = c(1,1,1))
+```
+
+## - Modelo bottleneck
+```{r, echo=TRUE}
+# CALCULAR Ne Y TIEMPOS CON LAS FUNCIONES DESARROLLADAS
+mutation_rate = 1e-7; n<-10; L<-1e6; Ne=1e4; params_bottleneck <- list(T_bottleneck = 1e3, N_bottleneck_ratio = 0.1, T_recovery = 5e3)
+result_theta <- optimize_theta(SFS_obs=SFS_bottleneck, n=n, mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+result_theta_bottleneck <- result_theta$par
+result_Ti_values_bottleneck <- calculate_Ti(n, result_theta_bottleneck)
+
+# BOOTSTRAP
+n_bootstrap <- 100
+bootstrap_results_matrix_Ne <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results_matrix_Ti <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results <- bootstrap_SFS(SFS_bottleneck, n_bootstrap = n_bootstrap)
+for(b in 1:n_bootstrap) {
+  bootstrap_result_theta <- optimize_theta(SFS_obs=bootstrap_results[b,], n=n,
+                                                        mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+  bootstrap_result_theta_bottleneck <- bootstrap_result_theta$par
+  if(!is.null(bootstrap_result_theta_bottleneck)) {
+    bootstrap_result_Ti_values_bottleneck <- calculate_Ti(n=n, theta_values = bootstrap_result_theta_bottleneck)
+  
+    bootstrap_results_matrix_Ne[b,] <- bootstrap_result_theta_bottleneck/(4*mutation_rate)
+    bootstrap_results_matrix_Ti[b,] <- bootstrap_result_Ti_values_bottleneck/mutation_rate
+  }
+}
+
+# MOSTRAR LOS RESULTADOS EN GRAFICOS 
+# Bootstrap
+plot(bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,], type="s", xlab="Time (gen)", ylab="Ne", main="BOTTLENECK\n Skyline plot Ne vs Time", ylim=c(min(bootstrap_results_matrix_Ne), max(bootstrap_results_matrix_Ne))); 
+for(b in 2:n_bootstrap) 
+  lines(x=bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,],col="grey",type="s")
+
+# Real parameters
+x_values <- seq(from = min(result_Ti_values_bottleneck / mutation_rate), to = max(result_Ti_values_bottleneck / mutation_rate), length.out = 100)
+
+is_before_bottleneck <- x_values < params_bottleneck$T_bottleneck
+is_in_bottleneck <- x_values >= params_bottleneck$T_bottleneck & x_values < params_bottleneck$T_recovery
+is_after_recovery <- x_values >= params_bottleneck$T_recovery
+
+y_values <- c(rep(Ne, sum(is_before_bottleneck)), rep(Ne * params_bottleneck$N_bottleneck_ratio, sum(is_in_bottleneck)),  rep(Ne, sum(is_after_recovery)))
+
+lines(x = x_values, y = y_values, type = "s", col = "red")
+
+#Inferred parameters
+lines(x=(result_Ti_values_bottleneck/mutation_rate),  y=(result_theta_bottleneck/(4*mutation_rate)), type="s", col="black"); 
+legend("topright",col = c("black","red","grey"),legend=c("Inferred","True","Bootstrap"),lwd = c(1,1,1))
+```
+
+## - Modelo con migración 
+```{r, echo=TRUE}
+# CALCULAR Ne Y TIEMPOS CON LAS FUNCIONES DESARROLLADAS
+mutation_rate = 1e-7; n<-10; L<-1e6; params_migration <- list(m_rate = 5e-5, N1 = 1e3, N2 = 1e3)
+result_theta <- optimize_theta(SFS_obs=SFS_migration, n=n, mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+result_theta_migration <- result_theta$par
+result_Ti_values_migration <- calculate_Ti(n, result_theta_migration)
+
+# BOOTSTRAP
+n_bootstrap <- 100
+bootstrap_results_matrix_Ne <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results_matrix_Ti <- array(0,dim=c(n_bootstrap,n-1))
+bootstrap_results <- bootstrap_SFS(SFS_migration, n_bootstrap = n_bootstrap)
+for(b in 1:n_bootstrap) {
+  bootstrap_result_theta <- optimize_theta(SFS_obs=bootstrap_results[b,], n=n,
+                                                        mu=mutation_rate, theta_range=c(1e-5,1e-1), L=L)
+
+  bootstrap_result_theta_migration <- bootstrap_result_theta$par
+  if(!is.null(bootstrap_result_theta_migration)) {
+    bootstrap_result_Ti_values_migration <- calculate_Ti(n=n, theta_values = bootstrap_result_theta_migration)
+  
+    bootstrap_results_matrix_Ne[b,] <- bootstrap_result_theta_migration/(4*mutation_rate)
+    bootstrap_results_matrix_Ti[b,] <- bootstrap_result_Ti_values_migration/mutation_rate
+  }
+}
+
+# MOSTRAR LOS RESULTADOS EN GRAFICOS 
+# Bootstrap
+plot(bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,], type="s", xlab="Time (gen)", ylab="Ne", main="MIGRATION\n Skyline plot Ne vs Time", ylim=c(min(bootstrap_results_matrix_Ne), max(bootstrap_results_matrix_Ne))); 
+for(b in 2:n_bootstrap) 
+  lines(x=bootstrap_results_matrix_Ti[b,],y=bootstrap_results_matrix_Ne[b,],col="grey",type="s")
+
+# Real parameters
+lines(x=(result_Ti_values_migration/mutation_rate),  y=rep(1e4,n-1), type="s",  col="red")
+
+# Inferred parameters
+lines(x=(result_Ti_values_migration/mutation_rate),  y=(result_theta_migration/(4*mutation_rate)), type="s", col="black"); 
+legend("topright",col = c("black","red","grey"),legend=c("Inferred","True","Bootstrap"),lwd = c(1,1,1))
+```
+
+## - Modelo de múltiples épocas
+```{r, echo=TRUE}
+# CALCULAR Ne Y TIEMPOS CON LAS FUNCIONES DESARROLLADAS
+mutation_rate = 1e-7; n <- 10; L <- 1e6; Ne=1e4; params_multi_epoch <- list(epoch_changes = epoch_changes)
+result_theta <- optimize_theta(SFS_obs = SFS_multi_epoch, n = n, mu = mutation_rate, theta_range = c(1e-5, 1e-1), L = L)
+
+result_theta_multi_epoch <- result_theta$par
+result_Ti_values_multi_epoch <- calculate_Ti(n, result_theta_multi_epoch)
+
+# BOOTSTRAP
+n_bootstrap <- 100
+bootstrap_results_matrix_Ne <- array(0, dim = c(n_bootstrap, n - 1))
+bootstrap_results_matrix_Ti <- array(0, dim = c(n_bootstrap, n - 1))
+bootstrap_results <- bootstrap_SFS(SFS_multi_epoch, n_bootstrap = n_bootstrap)
+
+for (b in 1:n_bootstrap) {
+  bootstrap_result_theta <- optimize_theta(SFS_obs = bootstrap_results[b,], n = n,
+                                           mu = mutation_rate, theta_range = c(1e-5, 1e-1), L = L)
+  
+  bootstrap_result_theta_multi_epoch <- bootstrap_result_theta$par
+  if (!is.null(bootstrap_result_theta_multi_epoch)) {
+    bootstrap_result_Ti_values_multi_epoch <- calculate_Ti(n = n, theta_values = bootstrap_result_theta_multi_epoch)
+    
+    bootstrap_results_matrix_Ne[b,] <- bootstrap_result_theta_multi_epoch / (4 * mutation_rate)
+    bootstrap_results_matrix_Ti[b,] <- bootstrap_result_Ti_values_multi_epoch / mutation_rate
+  }
+}
+
+# MOSTRAR LOS RESULTADOS EN GRAFICOS
+# Bootstrap
+plot(bootstrap_results_matrix_Ti[b,], y = bootstrap_results_matrix_Ne[b,], type = "s", xlab = "Time (gen)", ylab = "Ne", main = "MULTI-EPOCH MODEL\n Skyline plot Ne vs Time", ylim = c(min(bootstrap_results_matrix_Ne), max(bootstrap_results_matrix_Ne)))
+for (b in 2:n_bootstrap) 
+  lines(x = bootstrap_results_matrix_Ti[b,], y = bootstrap_results_matrix_Ne[b,], col = "grey", type = "s")
+
+# Reales
+x_values <- seq(from = min(result_Ti_values_multi_epoch / mutation_rate), to = max(result_Ti_values_multi_epoch / mutation_rate), length.out = 100)
+y_values <- numeric(length(x_values))
+
+for (i in 1:length(x_values)) {
+  t <- x_values[i]
+  
+  for (epoch in epoch_changes) {
+    if (t >= epoch$time) {
+      N_ratio <- epoch$N_ratio
+    } else {
+      break
+    }
+  }
+  
+  if (t < 2500) {
+    y_values[i] <- Ne 
+  } else if (t >= 2500 && t < 5000) {
+    y_values[i] <- Ne * N_ratio 
+  } else if (t >= 5000 && t < 7500) {
+    y_values[i] <- Ne * N_ratio
+  } else if (t >= 7500 && t < 10000) {
+    y_values[i] <- Ne * N_ratio
+  } else {
+    y_values[i] <- Ne
+  }
+}
+lines(x = x_values, y = y_values, type = "s", col = "red")
+
+# Inferred
+lines(x = result_Ti_values_multi_epoch / mutation_rate, y = result_theta_multi_epoch / (4 * mutation_rate), type = "s", col = "black")
+legend("topright", col = c("black", "red", "grey"), legend = c("Inferred", "True", "Bootstrap"), lwd = c(1, 1, 1))
+```
